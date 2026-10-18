@@ -2,6 +2,8 @@ from oculus_reader.FPS_counter import FPSCounter
 from oculus_reader.buttons_parser import parse_buttons
 import numpy as np
 import threading
+import socket
+import shlex
 import time
 import os
 from ppadb.client import Client as AdbClient
@@ -20,13 +22,19 @@ class OculusReader:
             port = 5555,
             APK_name='com.rail.oculus.teleop',
             print_FPS=False,
-            run=True
+            run=True,
+            pose_frame="head",
         ):
         self.running = False
+        self._connection = None
         self.last_transforms = {}
         self.last_buttons = {}
         self._lock = threading.Lock()
-        self.tag = 'wE9ryARX'
+        if pose_frame not in ("head", "world"):
+            raise ValueError("pose_frame must be head or world")
+        self.tag = 'wE9ryWORLD' if pose_frame == "world" else 'wE9ryARX'
+        self.last_received_monotonic = None
+        self.packet_sequence = 0
 
         self.ip_address = ip_address
         self.port = port
@@ -45,14 +53,22 @@ class OculusReader:
 
     def run(self):
         self.running = True
-        self.device.shell('am start -n "com.rail.oculus.teleop/com.rail.oculus.teleop.MainActivity" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER')
-        self.thread = threading.Thread(target=self.device.shell, args=("logcat -T 0", self.read_logcat_by_line))
+        component = self.APK_name + "/" + self.APK_name + ".MainActivity"
+        self.device.shell("am start -n " + shlex.quote(component) +
+                          " -a android.intent.action.MAIN -c android.intent.category.LAUNCHER")
+        self.thread = threading.Thread(target=self.device.shell, args=("logcat -T 0", self.read_logcat_by_line), daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            try:
+                connection.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         if hasattr(self, 'thread'):
-            self.thread.join()
+            self.thread.join(timeout=2)
 
     def get_network_device(self, client, retry=0):
         try:
@@ -98,7 +114,17 @@ class OculusReader:
     def install(self, APK_path=None, verbose=True, reinstall=False):
         try:
             installed = self.device.is_installed(self.APK_name)
+            if not installed and APK_path is None and self.APK_name != "com.rail.oculus.teleop":
+                raise FileNotFoundError(
+                    "Quest passthrough APK is not installed. Build real_world/quest_teleop "
+                    "and install its APK with adb install -r before starting world mode."
+                )
             if not installed or reinstall:
+                if APK_path is None and self.APK_name != "com.rail.oculus.teleop":
+                    raise FileNotFoundError(
+                        "Quest passthrough APK is not installed. Build real_world/quest_teleop "
+                        "and install its APK with adb install -r before starting world mode."
+                    )
                 if APK_path is None:
                     APK_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'APK', 'teleop-debug.apk')
                 success = self.device.install(APK_path, test=True, reinstall=reinstall)
@@ -181,20 +207,40 @@ class OculusReader:
         with self._lock:
             return self.last_transforms, self.last_buttons
 
+    def get_snapshot(self):
+        """Atomic packet and receipt time; polling never refreshes freshness."""
+        with self._lock:
+            return {
+                "poses": {k: v.copy() for k, v in self.last_transforms.items()},
+                "buttons": dict(self.last_buttons),
+                "received_monotonic": self.last_received_monotonic,
+                "sequence": self.packet_sequence,
+            }
+
     def read_logcat_by_line(self, connection):
+        self._connection = connection
         file_obj = connection.socket.makefile()
         while self.running:
             try:
-                line = file_obj.readline().strip()
+                line = file_obj.readline()
+                if not line:
+                    break
+                line = line.strip()
                 data = self.extract_data(line)
                 if data:
                     transforms, buttons = OculusReader.process_data(data)
+                    if transforms is None or buttons is None:
+                        continue
                     with self._lock:
                         self.last_transforms, self.last_buttons = transforms, buttons
+                        self.last_received_monotonic = time.monotonic()
+                        self.packet_sequence += 1
                     if self.print_FPS:
                         self.fps_counter.getAndPrintFPS()
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, ValueError, IndexError):
                 pass
+            except OSError:
+                break
         file_obj.close()
         connection.close()
 
